@@ -1,2 +1,239 @@
-# Uni-Macro
-Code and data for the paper Uni-Macro
+# UniMacro (code release)
+
+This repository contains the code to preprocess polymer datasets (CSV → PKL) and train/evaluate models for downstream tasks.
+
+> You said you are a GitHub beginner. This README is written to be copy-paste runnable.
+
+---
+
+## 0. Environment
+
+We provide a Conda environment file.
+
+```bash
+conda env create -f environment.yml
+conda activate unimacro
+```
+
+Notes:
+- Python: 3.9
+- PyTorch: 2.5 (CUDA 12.1)
+- RDKit is required for SMILES parsing and conformer generation.
+
+---
+
+## 1. Data format (CSV)
+
+Each dataset is a CSV file.
+
+### 1.1 Required columns
+
+The preprocessing script reads the following column patterns:
+
+#### SMILES segments
+- `SMILES0`, `SMILES1`, ...
+- In this codebase, the maximum number of segments is **2** (see `MAX_SEGMENTS = 2` in the preprocessing script), so typically you will provide:
+  - `SMILES0` (required)
+  - `SMILES1` (optional)
+
+#### Segment-level numeric features (per SMILES segment)
+- `seg{k}_feat{i}`
+- In this codebase, per segment you can provide up to **2** local features (`MAX_LOCAL_FEATS = 2`):
+  - `seg0_feat0`, `seg0_feat1`
+  - `seg1_feat0`, `seg1_feat1`
+
+Examples: degree of polymerization, block fraction, etc.
+
+#### Global numeric features (shared by the full sample)
+- `glob_feat{j}`
+- In this codebase, you can provide up to **2** global features (`MAX_GLOBAL_FEATS = 2`):
+  - `glob_feat0`, `glob_feat1`
+
+Examples: temperature, pressure, etc.
+
+#### Labels
+- One or multiple label columns (e.g., `Tg`, `Ei`, ...)
+- Specify label column(s) by `--labels`, e.g. `--labels Tg` or `--labels Tg,Ei`
+
+### 1.2 Optional columns
+
+#### `fold` (recommended for fixed CV splits)
+If the CSV contains a `fold` column, preprocessing will use it to assign each row to a fold:
+- validation fold for `--fold k` in training is `fold{k}`
+
+If `fold` is not provided, folds are assigned randomly using `--seed`.
+
+---
+
+## 2. Preprocess: CSV → PKL
+
+Script: `src/preprocess/preprocessing_polymer.py`
+
+### 2.1 Finetune task (recommended for downstream regression/classification)
+
+This produces a single PKL file that contains all samples + their fold assignments.
+
+Recommended command (also exports split indices and per-fold train/val CSVs):
+
+```bash
+python src/preprocess/preprocessing_polymer.py \
+  --task finetune \
+  --csv /path/to/your_dataset.csv \
+  --labels Tg \
+  --kfold 5 \
+  --seed 42 \
+  --outroot data/processed \
+  --dataset-name your_dataset_name \
+  --export-splits
+```
+
+Outputs (under `data/processed/your_dataset_name/`):
+- `main/split.pkl`: main file used by `src/main.py`
+- `index/split_fold{k}.pkl`: indices in the style of PerioGT (train/val/test)
+- `csv/train{k}.csv`, `csv/val{k}.csv`: exported fold CSVs
+
+If you prefer to specify the PKL path directly (without `--outroot`):
+
+```bash
+python src/preprocess/preprocessing_polymer.py \
+  --task finetune \
+  --csv /path/to/your_dataset.csv \
+  --labels Tg \
+  --kfold 5 \
+  --seed 42 \
+  --output data/processed/your_dataset_name.pkl \
+  --export-splits
+```
+
+### 2.2 Pretrain task (optional)
+
+The same script can also shard a large CSV into multiple `shard*.pkl` files:
+
+```bash
+python src/preprocess/preprocessing_polymer.py \
+  --task pretrain \
+  --csv /path/to/pretrain.csv \
+  --labels dummy \
+  --kfold 5 \
+  --seed 42 \
+  --outdir data/pretrain_shards
+```
+
+(Labels are kept in each sample dict, but for pretraining they may be unused.)
+
+---
+
+## 3. Finetune training
+
+Entry point: `src/main.py`
+
+### 3.1 Single GPU
+
+```bash
+python src/main.py \
+  --main_task finetune \
+  --task_type reg \
+  --dataset_name your_dataset_name \
+  --fold 0 \
+  --pkl_path data/processed/your_dataset_name/main/split.pkl \
+  --epochs 600 \
+  --batch_size 16 \
+  --lr 1e-4 \
+  --weight_decay 1e-4
+```
+
+Notes:
+- By default, the code tries to load `--weight_path` (which is set to an internal absolute path in this repo). If the checkpoint is not found, it will automatically train from scratch.
+- For classification, use `--task_type cls`.
+
+### 3.2 Multi-GPU (DDP)
+
+```bash
+torchrun --standalone --nproc_per_node 4 src/main.py \
+  --distributed \
+  --main_task finetune \
+  --task_type reg \
+  --dataset_name your_dataset_name \
+  --fold 0 \
+  --pkl_path data/processed/your_dataset_name/main/split.pkl
+```
+
+### 3.3 Outputs
+
+By default, results are written to:
+- `results/<dataset_name>/fold_<k>/...`
+
+This includes:
+- `metrics.json`
+- `checkpoints/checkpoint.pt` (best model)
+- `predictions/*.npy` (residuals / confusion matrix, etc.)
+
+---
+
+## 4. What to upload to GitHub (recommended)
+
+### 4.1 Must-have (code)
+- `src/` (training, dataloader, models, preprocessing)
+- `environment.yml`
+- `README.md`
+
+### 4.2 Data
+GitHub has a practical size limit (and reviewers often prefer a DOI-based repository). Recommended options:
+
+**Option A (recommended): upload data to Zenodo / Figshare / OSF**
+- Upload `dataset.zip` (the CSVs used in the paper)
+- Put the download link + checksum in this README
+
+**Option B: store data in GitHub using Git LFS**
+- Use this only if the dataset is not huge and you really want it inside GitHub.
+
+### 4.3 What NOT to upload (usually)
+- Large checkpoints: `*.pt`
+- Generated features / processed data: `*.pkl`, `*.lmdb`
+- Training outputs: `results/`
+
+(You can publish *final* checkpoints separately if the journal requires it, preferably via Zenodo.)
+
+---
+
+## 5. Minimal “how to publish” workflow (already have an empty GitHub repo)
+
+Assuming you are in the project root (this folder):
+
+```bash
+# 1) initialize git (if not yet)
+git init
+
+# 2) add your remote (replace with your repo URL)
+git remote add origin https://github.com/<user>/<repo>.git
+
+# 3) create the first commit
+git add -A
+git commit -m "Initial release"
+
+# 4) push to GitHub (main branch)
+git branch -M main
+git push -u origin main
+```
+
+If you need Git LFS for large files:
+
+```bash
+git lfs install
+# example patterns
+git lfs track "*.pt" "*.zip" "*.lmdb"
+```
+
+---
+
+## 6. Troubleshooting
+
+- **RDKit import errors**: make sure you created the conda env from `environment.yml`.
+- **No SMILES columns found**: check that your CSV has `SMILES0` (and optionally `SMILES1`).
+- **Want fixed CV folds**: add a `fold` column to the CSV before preprocessing.
+
+---
+
+## Contact
+
+If you have questions about running the code or dataset format, please open an issue in this repository.
