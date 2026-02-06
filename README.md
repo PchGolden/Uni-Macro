@@ -170,7 +170,7 @@ python src/preprocess/preprocessing_polymer.py \
   --outdir data/pretrain_shards
 ```
 
-(Labels are kept in each sample dict, but for pretraining they may be unused.)
+The pretrain weights involved in this work can be found in 10.5281/zenodo.18509440 and the respoitory of Uni-Mol2 (https://github.com/deepmodeling/Uni-Mol/tree/main/unimol2)
 
 ---
 
