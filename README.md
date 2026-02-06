@@ -30,12 +30,13 @@ The preprocessing script reads the following column patterns:
 
 #### SMILES segments
 - `SMILES0`, `SMILES1`, ...
-- In this codebase, the maximum number of segments is controlled by `MAX_SEGMENTS` in the preprocessing script, so typically you will provide:
+- The maximum number of segments is controlled by `MAX_SEGMENTS` in the preprocessing script, so typically you will provide:
   - `SMILES0` (required)
   - `SMILES1` (optional)
   - `SMILES2` (optional)
   - ...
   - `SMILES{MAX_SEGMENTS - 1}` (optional)
+- For homopolymer datasets such as ```Egc.csv```, set MAX_SEGMENTS to 1. For copolymer dataset such as PE-I that includes up to six distinct SMILES, set MAX_SEGMENTS to 6.
 
 #### Segment-level numeric features (per SMILES segment)
 - `seg{k}_feat{i}`
@@ -169,9 +170,3 @@ This includes:
 - `predictions/*.npy` (residuals / confusion matrix, etc.)
 
 ---
-
-## 4. Troubleshooting
-
-- **RDKit import errors**: make sure you created the conda env from `environment.yml`.
-- **No SMILES columns found**: check that your CSV has `SMILES0` (and optionally `SMILES1`).
-- **Want fixed CV folds**: add a `fold` column to the CSV before preprocessing.
