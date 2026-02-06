@@ -22,7 +22,7 @@ Notes:
 
 ## 1. Data format (CSV)
 
-Each dataset is a CSV file.
+Each dataset is a CSV file. All datasets used in this work are provided as CSV files and are located in the ```/datasets``` folder.
 
 ### 1.1 Required columns
 
