@@ -2,8 +2,6 @@
 
 This repository contains the code to preprocess polymer datasets (CSV → PKL) and train/evaluate models for downstream tasks.
 
-> You said you are a GitHub beginner. This README is written to be copy-paste runnable.
-
 ---
 
 ## 0. Environment
@@ -170,70 +168,8 @@ This includes:
 
 ---
 
-## 4. What to upload to GitHub (recommended)
-
-### 4.1 Must-have (code)
-- `src/` (training, dataloader, models, preprocessing)
-- `environment.yml`
-- `README.md`
-
-### 4.2 Data
-GitHub has a practical size limit (and reviewers often prefer a DOI-based repository). Recommended options:
-
-**Option A (recommended): upload data to Zenodo / Figshare / OSF**
-- Upload `dataset.zip` (the CSVs used in the paper)
-- Put the download link + checksum in this README
-
-**Option B: store data in GitHub using Git LFS**
-- Use this only if the dataset is not huge and you really want it inside GitHub.
-
-### 4.3 What NOT to upload (usually)
-- Large checkpoints: `*.pt`
-- Generated features / processed data: `*.pkl`, `*.lmdb`
-- Training outputs: `results/`
-
-(You can publish *final* checkpoints separately if the journal requires it, preferably via Zenodo.)
-
----
-
-## 5. Minimal “how to publish” workflow (already have an empty GitHub repo)
-
-Assuming you are in the project root (this folder):
-
-```bash
-# 1) initialize git (if not yet)
-git init
-
-# 2) add your remote (replace with your repo URL)
-git remote add origin https://github.com/<user>/<repo>.git
-
-# 3) create the first commit
-git add -A
-git commit -m "Initial release"
-
-# 4) push to GitHub (main branch)
-git branch -M main
-git push -u origin main
-```
-
-If you need Git LFS for large files:
-
-```bash
-git lfs install
-# example patterns
-git lfs track "*.pt" "*.zip" "*.lmdb"
-```
-
----
-
-## 6. Troubleshooting
+## 4. Troubleshooting
 
 - **RDKit import errors**: make sure you created the conda env from `environment.yml`.
 - **No SMILES columns found**: check that your CSV has `SMILES0` (and optionally `SMILES1`).
 - **Want fixed CV folds**: add a `fold` column to the CSV before preprocessing.
-
----
-
-## Contact
-
-If you have questions about running the code or dataset format, please open an issue in this repository.
