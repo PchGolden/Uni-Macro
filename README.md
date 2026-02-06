@@ -1,6 +1,6 @@
 # UniMacro (code release)
 
-This repository contains the code to preprocess polymer datasets (CSV → PKL) and train/evaluate models for downstream tasks.
+This repository contains the code to preprocess polymer datasets (CSV → PKL) and train/evaluate models for downstream tasks. The framework uses SMILES strings as the primary molecular representation. It also supports multi-SMILES inputs (e.g., for copolymers or mixtures). Since SMILES are primarily parsed by RDKit to extract molecular features, other molecular formats compatible with RDKit should also be functional, such as .mol files (use ```RDKit.Chem.MolFromMolFiles```)
 
 ---
 
@@ -30,21 +30,23 @@ The preprocessing script reads the following column patterns:
 
 #### SMILES segments
 - `SMILES0`, `SMILES1`, ...
-- In this codebase, the maximum number of segments is **2** (see `MAX_SEGMENTS = 2` in the preprocessing script), so typically you will provide:
+- In this codebase, the maximum number of segments is controlled by `MAX_SEGMENTS` in the preprocessing script, so typically you will provide:
   - `SMILES0` (required)
   - `SMILES1` (optional)
+  - `SMILES2` (optional)
+  - ...
+  - `SMILES{MAX_SEGMENTS - 1}` (optional)
 
 #### Segment-level numeric features (per SMILES segment)
 - `seg{k}_feat{i}`
-- In this codebase, per segment you can provide up to **2** local features (`MAX_LOCAL_FEATS = 2`):
+- By default, per segment you can provide up to **2** local features (`MAX_LOCAL_FEATS = 2`, feel free to change it to the actual maximum number of features of the segments):
   - `seg0_feat0`, `seg0_feat1`
-  - `seg1_feat0`, `seg1_feat1`
 
 Examples: degree of polymerization, block fraction, etc.
 
 #### Global numeric features (shared by the full sample)
 - `glob_feat{j}`
-- In this codebase, you can provide up to **2** global features (`MAX_GLOBAL_FEATS = 2`):
+- In this codebase, you can provide up to **2** global features (`MAX_GLOBAL_FEATS = 2`, feel free to change it to the actual maximum number of features of the segments):
   - `glob_feat0`, `glob_feat1`
 
 Examples: temperature, pressure, etc.
@@ -69,7 +71,7 @@ Script: `src/preprocess/preprocessing_polymer.py`
 
 ### 2.1 Finetune task (recommended for downstream regression/classification)
 
-This produces a single PKL file that contains all samples + their fold assignments.
+This produces a single PKL file that contains all samples + their fold assignments. The preprocessing is typically fast, in our case (64 core, Intel Xeon6458), it takes typically 5-20s to finish the preprocessing process.
 
 Recommended command (also exports split indices and per-fold train/val CSVs):
 
@@ -134,7 +136,7 @@ python src/main.py \
   --dataset_name your_dataset_name \
   --fold 0 \
   --pkl_path data/processed/your_dataset_name/main/split.pkl \
-  --epochs 600 \
+  --epochs 100 \
   --batch_size 16 \
   --lr 1e-4 \
   --weight_decay 1e-4
