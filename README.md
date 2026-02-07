@@ -1,4 +1,4 @@
-# UniMacro (code release)
+# Uni-Macro (code release)
 
 This repository contains the code to preprocess polymer datasets (CSV → PKL) and train/evaluate models for downstream tasks. The framework uses SMILES strings as the primary molecular representation. It also supports multi-SMILES inputs (e.g., for copolymers or mixtures). Since SMILES are primarily parsed by RDKit to extract molecular features, other molecular formats compatible with RDKit should also be functional, such as .mol files (use ```rdkit.Chem.MolFromMolFiles```)
 
