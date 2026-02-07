@@ -97,7 +97,7 @@ Examples: degree of polymerization, block fraction, etc.
 
 #### Global numeric features (shared by the full sample)
 - `glob_feat{j}`
-- In this codebase, you can provide up to **2** global features (`MAX_GLOBAL_FEATS = 2`, feel free to change it to the actual maximum number of features of the segments):
+- In this codebase, you can provide up to **2** global features (`MAX_GLOBAL_FEATS = 2`, feel free to change it to the actual maximum number of features of the system):
   - `glob_feat0`, `glob_feat1`
 
 Examples: temperature, pressure, etc.
