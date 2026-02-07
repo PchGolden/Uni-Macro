@@ -140,7 +140,7 @@ python src/preprocess/preprocessing_polymer.py \
 
 Outputs (under `data/processed/your_dataset_name/`):
 - `main/split.pkl`: main file used by `src/main.py`
-- `index/split_fold{k}.pkl`: indices in the style of PerioGT (train/val/test)
+- `index/split_fold{k}.pkl`: indices in the ratio of 72/8/20 (train/val/test)
 - `csv/train{k}.csv`, `csv/val{k}.csv`: exported fold CSVs
 
 If you prefer to specify the PKL path directly (without `--outroot`):
