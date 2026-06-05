@@ -10,10 +10,7 @@ Minimal end-to-end workflow: **CSV → PKL → finetune**.
 
 ### 1) Create environment
 
-```bash
-conda env create -f environment.yml
-conda activate unimacro
-```
+- Check environment.yml and install requested dependencies
 
 ### 2) Prepare a CSV dataset
 
