@@ -51,22 +51,6 @@ Outputs are saved under `results/`.
 
 ---
 
-## 0. Environment
-
-We provide a Conda environment file.
-
-```bash
-conda env create -f environment.yml
-conda activate unimacro
-```
-
-Notes:
-- Python: 3.9
-- PyTorch: 2.5 (CUDA 12.1)
-- RDKit is required for SMILES parsing and conformer generation.
-
----
-
 ## 1. Data format (CSV)
 
 Each dataset is a CSV file. All datasets used in this work are provided as CSV files and are located in the ```/datasets``` folder.
