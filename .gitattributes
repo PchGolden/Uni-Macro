@@ -1,3 +1,2 @@
 # Existing source files use CRLF. Do not flag the CR as trailing whitespace.
 *.py whitespace=cr-at-eol
-
