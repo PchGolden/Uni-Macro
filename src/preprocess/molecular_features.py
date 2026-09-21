@@ -4,7 +4,6 @@ from typing import List, Tuple, Dict
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.rdmolops import GetDistanceMatrix
-from rdkit import RDLogger
 
 allowable_features = {
     "possible_atomic_num_list": list(range(1, 119)) + ["misc"],
@@ -36,6 +35,7 @@ allowable_features = {
     "possible_is_conjugated_list": [False, True],
 }
 
+
 def safe_index(l, e):
     """
     Return index of element e in list l. If e is not present, return the last index
@@ -44,18 +44,15 @@ def safe_index(l, e):
         return l.index(e)
     except:
         return len(l) - 1
-        
+
+
 def atom_to_feature_vector(atom):
     return [
         safe_index(allowable_features["possible_atomic_num_list"], atom.GetAtomicNum()),
         allowable_features["possible_chirality_list"].index(str(atom.GetChiralTag())),
         safe_index(allowable_features["possible_degree_list"], atom.GetTotalDegree()),
-        safe_index(
-            allowable_features["possible_formal_charge_list"], atom.GetFormalCharge()
-        ),
-        safe_index(
-            allowable_features["possible_numH_list"], atom.GetTotalNumHs()
-        ),
+        safe_index(allowable_features["possible_formal_charge_list"], atom.GetFormalCharge()),
+        safe_index(allowable_features["possible_numH_list"], atom.GetTotalNumHs()),
         safe_index(
             allowable_features["possible_number_radical_e_list"],
             atom.GetNumRadicalElectrons(),
@@ -67,32 +64,31 @@ def atom_to_feature_vector(atom):
         allowable_features["possible_is_aromatic_list"].index(atom.GetIsAromatic()),
         allowable_features["possible_is_in_ring_list"].index(atom.IsInRing()),
     ]
-    
+
+
 def bond_to_feature_vector(bond):
     bond_feature = [
-        safe_index(
-            allowable_features["possible_bond_type_list"], str(bond.GetBondType())
-        ),
+        safe_index(allowable_features["possible_bond_type_list"], str(bond.GetBondType())),
         allowable_features["possible_bond_stereo_list"].index(str(bond.GetStereo())),
         allowable_features["possible_is_conjugated_list"].index(bond.GetIsConjugated()),
     ]
     return bond_feature
 
+
 def compute_shortest_path_rdkit(mol: Chem.Mol) -> np.ndarray:
     """
     Use RDKit's GetDistanceMatrix to compute topological distances (number of bonds)
     between all pairs of atoms in the molecule.
-    Unconnected pairs are set to INF=510.
+    Off-diagonal zeros are replaced by 509. Other RDKit distance values
+    (including its disconnected-component sentinel) are left unchanged.
     """
     # get raw distance matrix (float64)
     d = GetDistanceMatrix(mol).astype(np.int32)
-    n = d.shape[0]
     INF = 509
     # replace off-diagonal zeros (unreachable) with INF
-    mask = (d == 0)
+    mask = d == 0
     # keep diagonal zeros
-    for i in range(n):
-        mask[i, i] = False
+    np.fill_diagonal(mask, False)
     d[mask] = INF
     return d
 
@@ -125,12 +121,14 @@ def embed_discrete_features_tensor(x: torch.Tensor, sizes: List[int]) -> torch.T
     return out
 
 
-def build_initial_graph(mol: Chem.Mol) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Chem.Mol, np.ndarray]:
+def build_initial_graph(
+    mol: Chem.Mol,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Chem.Mol, np.ndarray]:
     """
     Create a basic molecular graph from an RDKit Mol object.
     Uses heavy atoms only. Returns:
-      node_attr: (N,8) int array of atom features in order
-        [chirality, total_degree, formal_charge, total_H, radical_e, hybridization, is_aromatic, is_in_ring]
+      node_attr: (N,9) int array of atom features in order
+        [atomic_number_category, chirality, total_degree, formal_charge, total_H, radical_e, hybridization, is_aromatic, is_in_ring]
       edge_index: (2,E) int array of connectivity
       edge_attr: (E,3) int array of bond features
         [bond_type, bond_stereo, is_conjugated]
@@ -139,7 +137,7 @@ def build_initial_graph(mol: Chem.Mol) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     # add explicit H then remove to ensure correct connectivity
     mol_h = AllChem.AddHs(mol, addCoords=False)
     mol_h = AllChem.RemoveAllHs(mol_h)
-    # Replace atomic number 0 (e.g., "*") with 118 to avoid collision with padding_idx=0 in embeddings
+    # Replace atomic number 0 (e.g., "*") with 119 to avoid collision with padding_idx=0 in embeddings
     atomic_nums = np.array([atom.GetAtomicNum() for atom in mol_h.GetAtoms()], dtype=np.int32)
     atomic_nums[atomic_nums == 0] = 119
     # atom features
@@ -148,14 +146,14 @@ def build_initial_graph(mol: Chem.Mol) -> Tuple[np.ndarray, np.ndarray, np.ndarr
         node_feats.append(atom_to_feature_vector(atom))
     node_attr = np.array(node_feats, dtype=np.int32)
     # bond features
-    edge_list: List[Tuple[int,int]] = []
+    edge_list: List[Tuple[int, int]] = []
     edge_feats: List[List[int]] = []
     for bond in mol_h.GetBonds():
         i = bond.GetBeginAtomIdx()
         j = bond.GetEndAtomIdx()
-        
+
         bf = bond_to_feature_vector(bond)
-        
+
         edge_list.extend([(i, j), (j, i)])
         edge_feats.extend([bf, bf])
     if edge_list:
@@ -186,30 +184,13 @@ def build_graph_features(
       attn_bias: (N+1,N+1) float32 zeros
     """
     N = node_attr.shape[0]
-    
-# ------------------------------------------------------------
-# NOTE: Feature Embedding Index Offset Explanation
-# ------------------------------------------------------------
-# We offset all discrete features (atom_feat, edge_feat, degree, etc.)
-# after converting them to embedding indices using `embed_discrete_features`.
-# The final shift logic is as follows:
-#
-#   - All features use an initial offset of +1 during embedding (start from 1)
-#   - Then we add an additional +1 (¡ú total +2) to ensure:
-#       - index 0 is reserved for padding
-#       - index 1 is reserved for dropped/masked features
-#       - valid features start from index 2+
-#
-# This aligns with the UniMol official implementation, and ensures
-# proper use of `padding_idx=0` and masking during training.
-# ------------------------------------------------------------
-# Example:
-#   - drop_feat=True ¡ú feature[:] = 1  (explicitly masked)
-#   - drop_feat=False ¡ú feature += 2   (offset to valid embedding space)
-# ------------------------------------------------------------
+
+    # Retain the original index offsets: embedding starts at 1, followed by
+    # the feature-specific shifts below. Padding uses 0; dropped features use 1.
+    # Edge features receive an extra +1 before their dense matrix is assembled.
 
     # embed atom features (skip no dims)
-    atom_feat = embed_discrete_features(node_attr[:, 1:], [16]*8)
+    atom_feat = embed_discrete_features(node_attr[:, 1:], [16] * 8)
     # adjacency and degree
     adj = np.zeros((N, N), dtype=np.int32)
     adj[edge_index[0], edge_index[1]] = 1
@@ -242,11 +223,10 @@ def build_graph_features(
     feat["shortest_path"] = torch.from_numpy(sp).long()
     feat["degree"] = torch.from_numpy(degree).long()
     # pair type
-    z_idx = torch.from_numpy(node_attr[:, 0]).long()    
+    z_idx = torch.from_numpy(node_attr[:, 0]).long()
     pair = torch.stack(
-        (z_idx.unsqueeze(1).expand(N, N),    # Z_i
-         z_idx.unsqueeze(0).expand(N, N)),   # Z_j
-        dim=-1                               # (N, N, 2)
+        (z_idx.unsqueeze(1).expand(N, N), z_idx.unsqueeze(0).expand(N, N)),  # Z_i  # Z_j
+        dim=-1,  # (N, N, 2)
     )
     feat["pair_type"] = embed_discrete_features_tensor(pair, [128, 128])
     feat["attn_bias"] = torch.zeros((N + 1, N + 1), dtype=torch.float32)
