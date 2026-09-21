@@ -39,14 +39,19 @@ NUM_CONFS = 4
 MAX_TRIES = NUM_CONFS * 2
 
 
-def _dump_one(i: int, samples: List[Dict[str, Any]], outdir: Path, label_cols: List[str]) -> None:
-    header = {
+def _dataset_header(samples, label_cols):
+    """Shared metadata schema for complete datasets and pretraining shards."""
+    return {
         "glob_feature_count": MAX_GLOBAL_FEATS,
         "local_feature_count": MAX_LOCAL_FEATS,
         "max_segments": MAX_SEGMENTS,
         "label_names": label_cols,
         "samples": samples,
     }
+
+
+def _dump_one(i: int, samples: List[Dict[str, Any]], outdir: Path, label_cols: List[str]) -> None:
+    header = _dataset_header(samples, label_cols)
     with (outdir / f"shard{i}.pkl").open("wb") as f:
         pickle.dump(header, f, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"[OK] wrote shard{i}.pkl ({len(samples)} samples)")
@@ -76,7 +81,10 @@ def _restore_dummy(mol: Chem.Mol, idx_list: List[int]) -> None:
         mol.GetAtomWithIdx(idx).SetAtomicNum(0)
 
 
-def _embed_and_strip_h(smiles: str, mol_from_file:bool, ) -> Tuple[Chem.Mol, np.ndarray] | None:
+def _embed_and_strip_h(
+    smiles: str,
+    mol_from_file: bool,
+) -> Tuple[Chem.Mol, np.ndarray] | None:
     mol0 = _load_mol(smiles, mol_from_file)
     if mol0 is None:
         return None
@@ -91,9 +99,9 @@ def _embed_and_strip_h(smiles: str, mol_from_file:bool, ) -> Tuple[Chem.Mol, np.
 
         no_h_2d = Chem.RemoveAllHs(tmp2d)
         coords_2d = no_h_2d.GetConformer().GetPositions().astype(np.float32)
-        assert len(no_h_2d.GetAtoms()) == coords_2d.shape[0], (
-            f"2D coordinates shape is not aligned with {smiles}"
-        )
+        assert (
+            len(no_h_2d.GetAtoms()) == coords_2d.shape[0]
+        ), f"2D coordinates shape is not aligned with {smiles}"
         return no_h_2d, coords_2d
 
     mol_with_h = Chem.AddHs(mol0)
@@ -179,7 +187,7 @@ def _process_row(args: tuple) -> Dict[str, Any]:
 
     segment_ids: List[int] = []
     coords_list: List[np.ndarray] = []
-    node_feats_all: List[np.ndarray] = []
+    node_feats_all: List[torch.Tensor] = []
     edge_feats_all: List[torch.Tensor] = []
     sp_all: List[torch.Tensor] = []
     degree_all: List[torch.Tensor] = []
@@ -246,7 +254,9 @@ def _process_row(args: tuple) -> Dict[str, Any]:
         idx_start += N
 
     glob_feat = [
-        None if f"glob_feat{i}" not in row or pd.isna(row[f"glob_feat{i}"]) else row[f"glob_feat{i}"]
+        None
+        if f"glob_feat{i}" not in row or pd.isna(row[f"glob_feat{i}"])
+        else row[f"glob_feat{i}"]
         for i in range(MAX_GLOBAL_FEATS)
     ]
 
@@ -459,23 +469,26 @@ def export_kfold_train_val_csvs(
         val_df.to_csv(val_path, index=False)
 
         print(
-            f"[OK] CSV written: {train_path} (n={len(train_df)}) | "
-            f"{val_path} (n={len(val_df)})"
+            f"[OK] CSV written: {train_path} (n={len(train_df)}) | " f"{val_path} (n={len(val_df)})"
         )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser("CSV to polymer.pkl with full graph features")
-    parser.add_argument("--task", required=True, choices=["finetune", "pretrain"], default="finetune")
+    parser.add_argument(
+        "--task", required=True, choices=["finetune", "pretrain"], default="finetune"
+    )
     parser.add_argument("--csv", required=True, type=Path)
-    parser.add_argument("--output", type=Path, default=None, help="main output pkl for finetune task")
+    parser.add_argument(
+        "--output", type=Path, default=None, help="main output pkl for finetune task"
+    )
     parser.add_argument("--outdir", type=Path, help="output dir for pretrain task")
     parser.add_argument("--smiles-prefix", default="SMILES")
     parser.add_argument("--labels", default="label", help="Comma-separated list of label columns")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--kfold", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--export-splits",action="store_true")
+    parser.add_argument("--export-splits", action="store_true")
 
     parser.add_argument("--mol-from-file", action="store_true", default=False)
 
@@ -515,7 +528,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"[ERROR] {e}", file=sys.stderr)
             sys.exit(1)
 
-        tasks = [(idx, row, smiles_cols, label_cols, args.mol_from_file) for idx, row in df.iterrows()]
+        tasks = [
+            (idx, row, smiles_cols, label_cols, args.mol_from_file) for idx, row in df.iterrows()
+        ]
         samples: List[Dict[str, Any]] = []
         failed: List[Tuple[Any, Any]] = []
 
@@ -538,13 +553,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         fold_ids = _assign_folds_to_samples(samples, df, args.kfold, args.seed)
 
-        header = {
-            "glob_feature_count": MAX_GLOBAL_FEATS,
-            "local_feature_count": MAX_LOCAL_FEATS,
-            "max_segments": MAX_SEGMENTS,
-            "label_names": label_cols,
-            "samples": samples,
-        }
+        header = _dataset_header(samples, label_cols)
 
         main_path.parent.mkdir(parents=True, exist_ok=True)
         with main_path.open("wb") as f:

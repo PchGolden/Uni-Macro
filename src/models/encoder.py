@@ -1,4 +1,4 @@
-"""Refactored token?pair joint encoder (12?layer Transformer derivative)."""
+"""Joint token and pair encoder with residual attention and geometric updates."""
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -11,7 +11,7 @@ from .utils import DropPath, OuterProduct, TriangleMultiplication, Transition
 
 
 class EncoderBlock(nn.Module):
-    """Stacked *EncoderLayer*s with pre?norm and pair pathway."""
+    """Normalize token/pair inputs, then apply the encoder layers in order."""
 
     def __init__(
         self,
@@ -81,10 +81,8 @@ class EncoderBlock(nn.Module):
         n_valid = mask_bool.sum(-1, keepdim=True)
         scale = n_valid.clamp(min=1).float().pow(-0.5)
         op_mask = mask_bool.unsqueeze(-1).float()
-        #op_norm = scale[..., None, None]
         op_norm = scale.unsqueeze(-1).unsqueeze(-1)
-        pair_mask_scaled = pair_mask            
-        scale = scale[..., None]                
+        scale = scale[..., None]
 
         for layer in self.layers:
             node_repr, pair_repr = layer(
@@ -120,7 +118,7 @@ class EncoderLayer(nn.Module):
         wo_pair: bool = False,
     ) -> None:
         super().__init__()
-        
+
         self.wo_triopm = wo_triopm
         self.wo_pair = wo_pair
         self.dropout_module = DropPath(droppath_prob) if droppath_prob else nn.Dropout(dropout)
@@ -143,7 +141,9 @@ class EncoderLayer(nn.Module):
         self.final_layer_norm = nn.LayerNorm(embedding_dim)
         self.x_layer_norm_opm = nn.LayerNorm(embedding_dim)
 
-        self.ffn = Transition(embedding_dim, ffn_embedding_dim // embedding_dim, dropout=activation_dropout)
+        self.ffn = Transition(
+            embedding_dim, ffn_embedding_dim // embedding_dim, dropout=activation_dropout
+        )
         self.opm = OuterProduct(embedding_dim, pair_dim, d_hid=pair_hidden_dim)
 
         self.pair_layer_norm_trimul = nn.LayerNorm(pair_dim)
@@ -163,7 +163,7 @@ class EncoderLayer(nn.Module):
         self_attn_mask: Optional[torch.Tensor] = None,
         op_mask: Optional[torch.Tensor] = None,
         op_norm: Optional[torch.Tensor] = None,
-        scale: Optional[torch.Tensor] = None
+        scale: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # ---- self-attention on tokens -----------------------------------
         res = node_repr
@@ -173,22 +173,19 @@ class EncoderLayer(nn.Module):
 
         # ---- position-wise FFN -----------------------------------------
         node_repr = node_repr + self.dropout_module(self.ffn(self.final_layer_norm(node_repr)))
-        
-        
-        if self.wo_triopm or self.wo_pair:
-            pass
-        else:        
+
+        if not (self.wo_triopm or self.wo_pair):
             # ---- outer product mixing --------------------------------------
             pair_repr = pair_repr + self.dropout_module(
                 self.opm(self.x_layer_norm_opm(node_repr), op_mask, op_norm)
             )
-    
+
             # ---- triangle multiplication -----------------------------------
             pair_repr = pair_repr + self.pair_dropout(
                 self.pair_tri_mul(self.pair_layer_norm_trimul(pair_repr), pair_mask, scale)
             )
 
-        # ---- pair-wise FFN ---------------------------------------------
+        # The pair FFN remains active in both pair-pathway ablations.
         pair_repr = pair_repr + self.dropout_module(
             self.pair_ffn(self.pair_layer_norm_ffn(pair_repr))
         )

@@ -1,22 +1,28 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import pickle, torch, glob, os, random, lmdb, msgpack, zlib
+import os
+import pickle
+import random
+import zlib
+
+import lmdb
+import msgpack
 import torch
 import numpy as np
-from torch import Tensor
-from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from typing import List, Dict, Any
 from argparse import Namespace
 
-PAD_TOKEN_ID   = 0      # <- pad for src_token
-PAD_FEAT_VAL   = 0      # <- pad for discrete features
-PAD_SPD_VAL    = 511    # <- unreachable shortest-path  (already +1)
-PAD_BIAS_VAL   = float('-inf')
+PAD_TOKEN_ID = 0  # <- pad for src_token
+PAD_FEAT_VAL = 0  # <- pad for discrete features
+PAD_SPD_VAL = 511  # <- unreachable shortest-path  (already +1)
+PAD_BIAS_VAL = float("-inf")
 
 # ===========================================
-# 0. General Util: Deserialize LMDB to torch 
+# 0. General Util: Deserialize LMDB to torch
 # ===========================================
+
 
 def _to_tensor(obj):
     if isinstance(obj, dict):
@@ -43,7 +49,7 @@ def _deserialize(buf: bytes):
     decompressed = zlib.decompress(buf)
     unpacked = msgpack.unpackb(decompressed, raw=False)
     return _to_tensor(unpacked)
-    
+
 
 def _open_lmdb_readonly(path: str):
     is_dir = os.path.isdir(path)
@@ -56,7 +62,15 @@ def _open_lmdb_readonly(path: str):
         meminit=False,
         max_readers=256,
     )
-    
+
+
+def _lmdb_sample_buffer(txn, idx):
+    """Read either the current sample_<idx> key or the legacy numeric key."""
+    buf = txn.get(f"sample_{idx}".encode("utf-8"))
+    if buf is None:
+        buf = txn.get(str(idx).encode("utf-8"))
+    return buf
+
 
 def _lmdb_load_obj(buf: bytes):
     try:
@@ -69,26 +83,32 @@ def _lmdb_load_obj(buf: bytes):
     except Exception as e:
         raise RuntimeError("Unknown LMDB value format") from e
 
+
 # ============================================================
 # 1. Dataset Implementation ----------------------------------
 # ============================================================
+
 
 class _BaseDataset(Dataset):
     """
     Common logic for filtering by split and applying random 3D coordinate views.
     Shared by both Pickle and LMDB subclasses.
     """
+
     def __init__(self, fold: int, mode: str):
-        self.fold    = fold
-        self.mode    = mode
+        self.fold = fold
+        self.mode = mode
         self.augment = mode == "train"
 
     # ------- Interfaces that must be implemented by subclasses -------------
-    def _get_raw_sample(self, idx: int) -> dict: ...
-    def _build_id_list(self) -> list[int]: ...
+    def _get_raw_sample(self, idx: int) -> dict:
+        ...
+
+    def _build_id_list(self) -> list[int]:
+        ...
 
     # ------- Common logic -----------------------------------
-    def __len__(self): 
+    def __len__(self):
         return len(self.ids)
 
     def __getitem__(self, idx):
@@ -101,12 +121,14 @@ class _BaseDataset(Dataset):
             s["src_pos"] = coords[choice]  # [N, 3]
         return s
 
+
 # ---------------- PKL version -----------------------------
 class PolymerPickleDataset(_BaseDataset):
     def __init__(self, pkl_path, fold: int, mode: str, eval_parent_only: bool = False):
         super().__init__(fold, mode)
         self.eval_parent_only = eval_parent_only
-        self.samples = pickle.load(open(pkl_path, "rb"))["samples"]
+        with open(pkl_path, "rb") as handle:
+            self.samples = pickle.load(handle)["samples"]
         self.ids = self._build_id_list()
 
     def _build_id_list(self):
@@ -152,21 +174,20 @@ class PolymerLmDBDataset(_BaseDataset):
             with _open_lmdb_readonly(lmdb_path) as env:
                 with env.begin() as txn:
                     for i in range(self._size):
-                        buf = txn.get(f"sample_{i}".encode("utf-8"))
-                        if buf is None:
-                            buf = txn.get(str(i).encode("utf-8"))
+                        buf = _lmdb_sample_buffer(txn, i)
                         if buf is None:
                             continue
-        
+
                         sample = _lmdb_load_obj(bytes(buf))
                         sp = sample.get("split", "")
                         is_aug = sample.get("is_chain_aug", False)
-        
+
                         if mode == "val" and self.eval_parent_only and is_aug:
                             continue
-        
-                        if (mode == "train" and sp != f"fold{fold}") or \
-                           (mode == "val"   and sp == f"fold{fold}"):
+
+                        if (mode == "train" and sp != f"fold{fold}") or (
+                            mode == "val" and sp == f"fold{fold}"
+                        ):
                             self.ids.append(i)
 
     # Called separately by each worker to ensure env is local to their process
@@ -177,9 +198,7 @@ class PolymerLmDBDataset(_BaseDataset):
     def _get_raw_sample(self, idx: int) -> dict:
         self._require_env()
         with self.env.begin(buffers=True) as txn:
-            buf = txn.get(f"sample_{idx}".encode("utf-8"))
-            if buf is None:
-                buf = txn.get(str(idx).encode("utf-8"))
+            buf = _lmdb_sample_buffer(txn, idx)
             if buf is None:
                 raise KeyError(f"LMDB missing key for idx={idx}")
         return _lmdb_load_obj(bytes(buf))
@@ -238,51 +257,42 @@ class PolymerPretrainDatasetMixin:
 class PolymerPretrainDataset(PolymerPretrainDatasetMixin, PolymerPickleDataset):
     pass
 
+
 # LMDB source
 class PolymerPretrainLmDBDataset(PolymerPretrainDatasetMixin, PolymerLmDBDataset):
     pass
 
 
-
-
 # ---------- 2. Padding helpers ----------------------------------------
-def pad_1d(samples: List[torch.Tensor], pad_len: int, pad_value=0):
-    batch_size = len(samples)
-    tensor = samples[0].new_full((batch_size, pad_len), pad_value)
-    for i, x in enumerate(samples):
-        tensor[i, : x.shape[0]] = x
+def _pad_tensors(samples, shape, pad_value, atom_dims):
+    """Pad leading atom axes, preserving the first sample's dtype and device."""
+    tensor = samples[0].new_full((len(samples), *shape), pad_value)
+    for index, sample in enumerate(samples):
+        slices = tuple(slice(0, size) for size in sample.shape[:atom_dims])
+        tensor[(index, *slices)] = sample
     return tensor
+
+
+def pad_1d(samples: List[torch.Tensor], pad_len: int, pad_value=0):
+    return _pad_tensors(samples, (pad_len,), pad_value, atom_dims=1)
+
 
 def pad_1d_feat(samples: List[torch.Tensor], pad_len: int, pad_value=0):
-    batch_size = len(samples)
-    feat_size = samples[0].shape[-1]
-    tensor = samples[0].new_full((batch_size, pad_len, feat_size), pad_value)
-    for i, x in enumerate(samples):
-        tensor[i, : x.shape[0]] = x
-    return tensor
+    return _pad_tensors(samples, (pad_len, samples[0].shape[-1]), pad_value, atom_dims=1)
+
 
 def pad_2d(samples: List[torch.Tensor], pad_len: int, pad_value=0):
-    batch_size = len(samples)
-    tensor = samples[0].new_full((batch_size, pad_len, pad_len), pad_value)
-    for i, x in enumerate(samples):
-        n, m = x.shape
-        tensor[i, :n, :m] = x
-    return tensor
+    return _pad_tensors(samples, (pad_len, pad_len), pad_value, atom_dims=2)
+
 
 def pad_2d_feat(samples: List[torch.Tensor], pad_len: int, pad_value=0):
-    batch_size = len(samples)
-    feat_size = samples[0].shape[-1]
-    tensor = samples[0].new_full((batch_size, pad_len, pad_len, feat_size), pad_value)
-    for i, x in enumerate(samples):
-        n, m, _ = x.shape
-        tensor[i, :n, :m] = x
-    return tensor
+    return _pad_tensors(samples, (pad_len, pad_len, samples[0].shape[-1]), pad_value, atom_dims=2)
+
 
 def pad_base_mask(samples: List[torch.Tensor], pad_len: int):
     batch_size = len(samples)
     # note: official adds +1 inside
-    tensor = samples[0].new_full((batch_size, pad_len, pad_len),
-                                 float("-inf"))
+    tensor = samples[0].new_full((batch_size, pad_len, pad_len), float("-inf"))
     for i, b in enumerate(samples):
         n, m = b.shape
         # copy real block
@@ -294,32 +304,30 @@ def pad_base_mask(samples: List[torch.Tensor], pad_len: int):
 
 # ---------- 3. collate_fn ---------------------------------------------
 def collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-
-    # 0) Ensure each sample has atom_mask, 
+    # 0) Ensure each sample has atom_mask,
     for s in samples:
         N = s["atom_feat"].shape[0]
         s["atom_mask"] = torch.ones(N, dtype=torch.long)
 
     # ---------- 1. Calculate padding length ----------
-    special_T   = samples[0]['special_T']
-    max_node    = max(s["atom_mask"].shape[0] for s in samples)
-    token_dim   = (max_node + special_T + 3) // 4 * 4  # Multiple of 4: e.g. 12
-    node_pad_len = token_dim - special_T               # e.g. 8
+    special_T = samples[0]["special_T"]
+    max_node = max(s["atom_mask"].shape[0] for s in samples)
+    token_dim = (max_node + special_T + 3) // 4 * 4  # Multiple of 4: e.g. 12
+    node_pad_len = token_dim - special_T  # e.g. 8
 
     # ---------- 2. Define padding functions ----------
     pad_fns = {
-        "src_token"     : (pad_1d,       PAD_TOKEN_ID),
-        "src_pos"       : (pad_1d_feat,  0.0),
-        "atom_feat"     : (pad_1d_feat,  PAD_FEAT_VAL),
-        "atom_mask"     : (pad_1d,       0),
-        "edge_feat"     : (pad_2d_feat,  PAD_FEAT_VAL),
-        "shortest_path" : (pad_2d,       PAD_FEAT_VAL),
-        "degree"        : (pad_1d,       PAD_FEAT_VAL),
-        #"pair_type"     : (pad_2d_feat,  PAD_FEAT_VAL),
-        "segment_id"    : (pad_1d,       -1),
-        "target_token"  : (pad_1d,       PAD_TOKEN_ID),
-        "target_pos"    : (pad_1d_feat,  0.0),
-        "src_mask_cord" : (pad_1d,       0),
+        "src_token": (pad_1d, PAD_TOKEN_ID),
+        "src_pos": (pad_1d_feat, 0.0),
+        "atom_feat": (pad_1d_feat, PAD_FEAT_VAL),
+        "atom_mask": (pad_1d, 0),
+        "edge_feat": (pad_2d_feat, PAD_FEAT_VAL),
+        "shortest_path": (pad_2d, PAD_FEAT_VAL),
+        "degree": (pad_1d, PAD_FEAT_VAL),
+        "segment_id": (pad_1d, -1),
+        "target_token": (pad_1d, PAD_TOKEN_ID),
+        "target_pos": (pad_1d_feat, 0.0),
+        "src_mask_cord": (pad_1d, 0),
     }
 
     batched: Dict[str, Any] = {}
@@ -330,14 +338,11 @@ def collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
         # ---------- 3a. Keys that need padding based on atom count ----------
         if key in pad_fns:
             fn, pad_val = pad_fns[key]
-            pad_len = node_pad_len
-            batched[key] = fn(vals, pad_len, pad_val)
-            
-        elif key == "base_mask":                # The only exception
-            fn = pad_base_mask
-            pad_len = token_dim
-            batched[key] = fn(vals, pad_len)
-            
+            batched[key] = fn(vals, node_pad_len, pad_val)
+
+        elif key == "base_mask":  # The only exception
+            batched[key] = pad_base_mask(vals, token_dim)
+
         elif key == "pair_type":
             if vals[0].dim() == 2:
                 batched[key] = pad_2d(vals, node_pad_len, PAD_FEAT_VAL)
@@ -349,23 +354,27 @@ def collate_fn(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
 
         # ---------- 3b. Fixed-length keys, directly stack ----------
         elif key in {
-            "glob_feat", "glob_mask", "glob_valid_mask",
-            "seg_feat", "seg_feat_mask", "seg_valid_mask",
+            "glob_feat",
+            "glob_mask",
+            "glob_valid_mask",
+            "seg_feat",
+            "seg_feat_mask",
+            "seg_valid_mask",
         }:
             batched[key] = torch.stack(vals)
 
         # ---------- 3c. Label ----------
         elif key == "label":
-            batched[key] = torch.stack([
-                torch.tensor(list(v.values()), dtype=torch.float32) for v in vals
-            ])
+            batched[key] = torch.stack(
+                [torch.tensor(list(v.values()), dtype=torch.float32) for v in vals]
+            )
 
         # ---------- 3d. Keep the rest as a list ----------
         else:
             batched[key] = vals
 
     return batched
-    
+
 
 # ------------4. Dataloader Builder----------------------------------------------------
 def build_dataloader(
@@ -373,30 +382,27 @@ def build_dataloader(
     args: Namespace,
     mode: str = "train",
 ) -> tuple[DataLoader, DistributedSampler | None]:
-    is_train = mode == "train"
     is_pretrain = args.main_task == "pretrain"
-    is_train_loader = (
-        (mode == "train") or
-        (is_pretrain and mode == "full")
-    )
-    is_eval_loader = not is_train_loader
-    if args.main_task == "pretrain" and \
-       os.path.abspath(pkl_path) == os.path.abspath(
-           getattr(args, "pretrain_val_path", "")
-       ):
+    is_train_loader = (mode == "train") or (is_pretrain and mode == "full")
+    if args.main_task == "pretrain" and os.path.abspath(pkl_path) == os.path.abspath(
+        getattr(args, "pretrain_val_path", "")
+    ):
         is_train_loader = False
 
     # Choose dataset class based on file type and task
     is_lmdb = os.path.isdir(pkl_path) or pkl_path.endswith(".lmdb")
-    
+
     if is_lmdb:
         dataset_cls = PolymerPretrainLmDBDataset if is_pretrain else PolymerLmDBDataset
     else:
         dataset_cls = PolymerPretrainDataset if is_pretrain else PolymerPickleDataset
 
+    eval_parent_only = (
+        getattr(args, "eval_parent_only", True)
+        if mode == "val" and args.main_task != "pretrain"
+        else False
+    )
 
-    eval_parent_only = getattr(args, "eval_parent_only", True) if mode == "val" and args.main_task != "pretrain" else False
-    
     dataset = dataset_cls(
         pkl_path,
         fold=0 if is_pretrain else args.fold,

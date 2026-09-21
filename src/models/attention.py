@@ -1,8 +1,6 @@
-# ------------------------------------------------------------------
-# File: attention.py         (drop-in replacement)
-# ------------------------------------------------------------------
-import math
-from typing import Optional, List
+"""Gated multi-head attention with an additive molecular pair bias."""
+
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -38,10 +36,12 @@ def _init_linear(layer: nn.Linear, init_type: str, use_bias: bool = True) -> Non
         if layer.bias is not None and use_bias:
             nn.init.zeros_(layer.bias)
 
+
 class Attention(nn.Module):
     """
-    Multi-head attention with optional gating and pairwise bias,
-    refactored to eliminate external dependencies.
+    Multi-head attention with optional gating and pairwise bias.
+
+    Projection construction and initialization order are checkpoint/RNG contracts.
     """
 
     def __init__(
@@ -63,7 +63,7 @@ class Attention(nn.Module):
         self.gating = gating
         self.dropout = dropout
         total_dim = head_dim * num_heads
-        norm = head_dim ** -0.5
+        norm = head_dim**-0.5
         self.register_buffer("_norm", torch.tensor(norm), persistent=False)
 
         # ---- projection layers ----
@@ -85,11 +85,7 @@ class Attention(nn.Module):
 
     # ------------------------------------------------------------------ #
     def _shape(self, x: torch.Tensor) -> torch.Tensor:
-        return (
-            x.view(*x.shape[:-1], self.num_heads, self.head_dim)
-            .transpose(-2, -3)
-            .contiguous()
-        )
+        return x.view(*x.shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3).contiguous()
 
     # ------------------------------------------------------------------ #
     def forward(
@@ -115,16 +111,15 @@ class Attention(nn.Module):
         # --- compute attention scores ---
         attn = torch.matmul(q, k.transpose(-1, -2))  # [B, H, N, N]
 
-        bias = self.linear_bias(pair)                # [B, N, N, H]
+        bias = self.linear_bias(pair)  # [B, N, N, H]
         bias = bias.permute(0, 3, 1, 2).contiguous()  # [B, H, N, N]
-        
+
         if mask is not None:
             attn = attn + mask
-        if self.wo_pair:
-            pass
-        else:
+        if not self.wo_pair:
             attn = attn + bias
         attn = F.softmax(attn, dim=-1)
+        # Expose probabilities before dropout and NaN cleanup for analysis.
         self.last_attn = attn.detach()
         attn = F.dropout(attn, p=self.dropout, training=self.training)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
