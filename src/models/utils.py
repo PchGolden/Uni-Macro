@@ -1,3 +1,5 @@
+"""Feature embeddings, attention masks and geometric encoder primitives."""
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -7,8 +9,29 @@ from torch.utils.checkpoint import checkpoint
 from typing import List, Optional
 
 
-class AtomFeaturePlus(nn.Module):
+def _check_embedding_indices(values, name, size, size_name, *, context=""):
+    """Validate categorical indices while retaining the legacy diagnostics."""
+    if torch.any(values < 0):
+        print(f"? {name} has negative index")
+        print("min:", values.min().item())
+        raise RuntimeError(f"{name} < 0")
+    if torch.any(values >= size):
+        print(f"? {name} overflow{context}")
+        print("max:", values.max().item())
+        print(f"{size_name}:", size)
+        raise RuntimeError(f"{name} >= {size_name}")
 
+
+def _sum_numeric_projections(values, mask, projections, count, output):
+    """Accumulate numeric features in their original order and output dtype."""
+    for index in range(count):
+        value = values[..., index].unsqueeze(-1)
+        feature_mask = mask[..., index].unsqueeze(-1)
+        output += feature_mask * projections[index](value)
+    return output
+
+
+class AtomFeaturePlus(nn.Module):
     def __init__(
         self,
         num_atom: int,
@@ -21,14 +44,14 @@ class AtomFeaturePlus(nn.Module):
     ):
         super().__init__()
         # --- Same three types of embeddings as the official version ---
-        self.atom_encoder   = Embedding(num_atom,   hidden_dim, padding_idx=0)
+        self.atom_encoder = Embedding(num_atom, hidden_dim, padding_idx=0)
         self.degree_encoder = Embedding(num_degree, hidden_dim, padding_idx=0)
-        self.vnode_encoder  = Embedding(1,          hidden_dim)  # [CLS] token
+        self.vnode_encoder = Embedding(1, hidden_dim)  # [CLS] token
         self.wo_node = wo_node
         self.wo_atom_feat = wo_atom_feat
         # --- Additional: projection layers for numeric global/segment features ---
         self.num_glob_feat = num_glob_feat
-        self.num_seg_feat  = num_seg_feat
+        self.num_seg_feat = num_seg_feat
         self.glob_projs = nn.ModuleList(
             [Linear(1, hidden_dim, bias=True, init="glorot") for _ in range(num_glob_feat)]
         )
@@ -38,164 +61,115 @@ class AtomFeaturePlus(nn.Module):
 
     # ------------------------------ forward ------------------------------
     def forward(self, batched_data, token_feat):
-    
-        x           = batched_data["atom_feat"]          # [B, N, F_a]
-        degree      = batched_data["degree"]             # [B, N]
-        seg_id      = batched_data["segment_id"]         # [B, N]
-        glob_f      = batched_data["glob_feat"]          # [B, G]
-        glob_mask   = batched_data["glob_mask"]          # [B, G]
-        glob_valid  = batched_data["glob_valid_mask"]
-        seg_f       = batched_data["seg_feat"]           # [B, S, F_s]
-        seg_f_mask  = batched_data["seg_feat_mask"]      # [B, S, F_s]
-        seg_valid   = batched_data["seg_valid_mask"]     # [B, S]
-    
-        B, N_atom = x.shape[:2]
-        S         = seg_f.size(1)
-        D         = token_feat.size(-1)
-        dtype     = token_feat.dtype
-        device    = x.device
+        x = batched_data["atom_feat"]  # [B, N, F_a]
+        degree = batched_data["degree"]  # [B, N]
+        glob_f = batched_data["glob_feat"]  # [B, G]
+        glob_mask = batched_data["glob_mask"]  # [B, G]
+        glob_valid = batched_data["glob_valid_mask"]
+        seg_f = batched_data["seg_feat"]  # [B, S, F_s]
+        seg_f_mask = batched_data["seg_feat_mask"]  # [B, S, F_s]
+        seg_valid = batched_data["seg_valid_mask"]  # [B, S]
 
+        B = x.shape[0]
+        S = seg_f.size(1)
+        D = token_feat.size(-1)
+        dtype = token_feat.dtype
+        device = x.device
 
-        # ===== DEBUG START =====
-        if torch.any(x < 0):
-            print("? atom_feat has negative index")
-            print("min:", x.min().item())
-            raise RuntimeError("atom_feat < 0")
-    
-        if torch.any(x >= self.atom_encoder.num_embeddings):
-            print("? atom_feat overflow")
-            print("max:", x.max().item())
-            print("num_atom:", self.atom_encoder.num_embeddings)
-            raise RuntimeError("atom_feat >= num_atom")
-    
-        if torch.any(degree < 0):
-            print("? degree has negative index")
-            print("min:", degree.min().item())
-            raise RuntimeError("degree < 0")
-    
-        if torch.any(degree >= self.degree_encoder.num_embeddings):
-            print("? degree overflow")
-            print("max:", degree.max().item())
-            print("num_degree:", self.degree_encoder.num_embeddings)
-            raise RuntimeError("degree >= num_degree")
-        # ===== DEBUG END =====
+        _check_embedding_indices(x, "atom_feat", self.atom_encoder.num_embeddings, "num_atom")
+        _check_embedding_indices(degree, "degree", self.degree_encoder.num_embeddings, "num_degree")
 
         # ---------- 1. Atom nodes ----------
         if self.wo_node:
             atom_vec = token_feat
         else:
             atom_emb = self.atom_encoder(x)
-        
+
             if self.wo_atom_feat is not None:
                 atom_emb[:, :, self.wo_atom_feat, :] = 0.0
             atom_vec = atom_emb.sum(dim=-2)
-        
+
             if self.wo_atom_feat is None or 1 not in self.wo_atom_feat:
-                atom_vec = atom_emb.sum(dim=-2) + self.degree_encoder(degree)
-        
+                atom_vec = atom_vec + self.degree_encoder(degree)
+
             atom_vec = atom_vec + token_feat
-    
+
         # ---------- 2. GLOB token ----------
         glob_vec = torch.zeros(B, D, device=device)
-        
 
-        for i in range(self.num_glob_feat):
-            val  = glob_f[:, i].unsqueeze(-1)            # [B,1]
-            gmsk = glob_mask[:, i].unsqueeze(-1)         # [B,1]
-            glob_vec += gmsk * self.glob_projs[i](val)   
+        glob_vec = _sum_numeric_projections(
+            glob_f, glob_mask, self.glob_projs, self.num_glob_feat, glob_vec
+        )
         # glob_vec=0 if entire row is None.
         glob_vec = glob_vec * glob_valid
-        glob_vec = glob_vec.unsqueeze(1)  
+        glob_vec = glob_vec.unsqueeze(1)
         # ---------- 3. SEG tokens ----------
         seg_vec = torch.zeros(B, S, D, device=device)
-        for j in range(self.num_seg_feat):
-            val  = seg_f[:, :, j].unsqueeze(-1)          # [B,S,1]
-            smsk = seg_f_mask[:, :, j].unsqueeze(-1)     # [B,S,1]
-            seg_vec += smsk * self.seg_projs[j](val)
+        seg_vec = _sum_numeric_projections(
+            seg_f, seg_f_mask, self.seg_projs, self.num_seg_feat, seg_vec
+        )
         # seg_valid
-        seg_vec = seg_vec * seg_valid.unsqueeze(-1)      # [B,S,D]
-    
+        seg_vec = seg_vec * seg_valid.unsqueeze(-1)  # [B,S,D]
+
         # ---------- 4. CLS ----------
         cls_vec = self.vnode_encoder.weight.unsqueeze(0).repeat(B, 1, 1)
-    
+
         # ---------- 5. Concat ----------
-        graph_node_feature = torch.cat(
-            [cls_vec, glob_vec, seg_vec, atom_vec], dim=1
-        ).type(dtype)                                    # [B, 1+1+S+N, D]
+        graph_node_feature = torch.cat([cls_vec, glob_vec, seg_vec, atom_vec], dim=1).type(
+            dtype
+        )  # [B, 1+1+S+N, D]
         return graph_node_feature
-        
+
 
 class EdgeFeaturePlus(nn.Module):
-
     def __init__(self, pair_dim, num_edge, num_spatial, wo_spd, wo_edge):
         super().__init__()
         self.pair_dim = pair_dim
-        self.edge_encoder       = Embedding(num_edge,    pair_dim, padding_idx=0)
-        self.shorest_path_encoder  = Embedding(num_spatial, pair_dim, padding_idx=0)
-        self.vnode_virtual_distance = Embedding(1,           pair_dim)  # virtual bias t
+        self.edge_encoder = Embedding(num_edge, pair_dim, padding_idx=0)
+        # Keep the legacy spelling: it is part of checkpoint state_dict keys.
+        self.shorest_path_encoder = Embedding(num_spatial, pair_dim, padding_idx=0)
+        self.vnode_virtual_distance = Embedding(1, pair_dim)  # virtual bias t
         self.wo_spd = wo_spd
         self.wo_edge = wo_edge
 
     # ------------------------------------------------------------------
     def forward(self, batched_data, graph_attn_bias):
-
-        shortest_path = batched_data["shortest_path"]          # [B,N,N]
+        shortest_path = batched_data["shortest_path"]  # [B,N,N]
         shortest_path = torch.clamp(shortest_path, max=511)
-        edge_input    = batched_data["edge_feat"]              # [B,N,N,K]
-        n_seg         = batched_data["seg_feat"].size(1)
-        N_atom        = shortest_path.size(-1)
-        special_len   = 1 + 1 + n_seg                          # CLS+GLOB+SEG
-        B             = graph_attn_bias.size(0)
+        edge_input = batched_data["edge_feat"]  # [B,N,N,K]
+        n_seg = batched_data["seg_feat"].size(1)
+        special_len = 1 + 1 + n_seg  # CLS+GLOB+SEG
 
-
-
-        # ===== DEBUG START =====
-        if torch.any(shortest_path < 0):
-            print("? shortest_path has negative index")
-            print("min:", shortest_path.min().item())
-            raise RuntimeError("shortest_path < 0")
-    
-        if torch.any(shortest_path >= self.shorest_path_encoder.num_embeddings):
-            print("? shortest_path overflow")
-            print("max:", shortest_path.max().item())
-            print("num_spatial:", self.shorest_path_encoder.num_embeddings)
-            raise RuntimeError("shortest_path >= num_spatial")
-    
-        if torch.any(edge_input < 0):
-            print("? edge_feat has negative index")
-            print("min:", edge_input.min().item())
-            raise RuntimeError("edge_feat < 0")
-    
-        if torch.any(edge_input >= self.edge_encoder.num_embeddings):
-            print("? edge_feat overflow")
-            print("max:", edge_input.max().item())
-            print("num_edge:", self.edge_encoder.num_embeddings)
-            raise RuntimeError("edge_feat >= num_edge")
-        # ===== DEBUG END =====
-
+        _check_embedding_indices(
+            shortest_path, "shortest_path", self.shorest_path_encoder.num_embeddings, "num_spatial"
+        )
+        _check_embedding_indices(
+            edge_input, "edge_feat", self.edge_encoder.num_embeddings, "num_edge"
+        )
 
         # ------ 1. atom - atom bias: shortest path + edge features ------
-        if self.wo_spd and self.wo_edge:
-            pass
-        else:
+        if not (self.wo_spd and self.wo_edge):
             if self.wo_spd:
-                atom_bias = self.edge_encoder(edge_input).mean(-2)     # [B,N,N,D]
+                atom_bias = self.edge_encoder(edge_input).mean(-2)  # [B,N,N,D]
             elif self.wo_edge:
-                atom_bias = self.shorest_path_encoder(shortest_path)   # [B,N,N,D]
+                atom_bias = self.shorest_path_encoder(shortest_path)  # [B,N,N,D]
             else:
-                atom_bias = self.shorest_path_encoder(shortest_path) + self.edge_encoder(edge_input).mean(-2)     # [B,N,N,D]            
+                atom_bias = self.shorest_path_encoder(shortest_path) + self.edge_encoder(
+                    edge_input
+                ).mean(
+                    -2
+                )  # [B,N,N,D]
             graph_attn_bias[:, special_len:, special_len:, :] = atom_bias
 
         # ------ 2. Any pair involving a special token -> use t bias ------
         t = self.vnode_virtual_distance.weight.view(1, 1, self.pair_dim)
-        graph_attn_bias[:, :special_len, :, :] = t             # row
-        graph_attn_bias[:, :, :special_len, :] = t             # col
-        
+        graph_attn_bias[:, :special_len, :, :] = t  # row
+        graph_attn_bias[:, :, :special_len, :] = t  # col
+
         return graph_attn_bias
 
 
 class SE3InvariantKernel(nn.Module):
-
     def __init__(
         self,
         pair_dim,
@@ -236,11 +210,8 @@ class GaussianKernel(nn.Module):
     def __init__(self, K=128, num_pair=512, std_width=1.0, start=0.0, stop=9.0):
         super().__init__()
         self.K = K
-        std_width = std_width
-        start = start
-        stop = stop
         mean = torch.linspace(start, stop, K)
-        self.std = (std_width * (mean[1] - mean[0]))
+        self.std = std_width * (mean[1] - mean[0])
         self.register_buffer("mean", mean)
         self.mul = Embedding(num_pair, 1, padding_idx=0)
         self.bias = Embedding(num_pair, 1, padding_idx=0)
@@ -248,18 +219,13 @@ class GaussianKernel(nn.Module):
         nn.init.constant_(self.mul.weight, 1.0)
 
     def forward(self, x, atom_pair):
-        # ===== DEBUG START =====
-        if torch.any(atom_pair < 0):
-            print("? atom_pair has negative index")
-            print("min:", atom_pair.min().item())
-            raise RuntimeError("atom_pair < 0")
-    
-        if torch.any(atom_pair >= self.mul.num_embeddings):
-            print("? atom_pair overflow in GaussianKernel")
-            print("max:", atom_pair.max().item())
-            print("num_pair:", self.mul.num_embeddings)
-            raise RuntimeError("atom_pair >= num_pair")
-        # ===== DEBUG END =====
+        _check_embedding_indices(
+            atom_pair,
+            "atom_pair",
+            self.mul.num_embeddings,
+            "num_pair",
+            context=" in GaussianKernel",
+        )
 
         mul = self.mul(atom_pair).abs().squeeze(-1)
         bias = self.bias(atom_pair).squeeze(-1)
@@ -267,8 +233,8 @@ class GaussianKernel(nn.Module):
         x = x.unsqueeze(-1).expand(-1, -1, -1, self.K)
         mean = self.mean.float().view(-1)
         return gaussian(x.float(), mean, self.std)
-        
-        
+
+
 class NonLinear(nn.Module):
     def __init__(self, input, output_size, hidden=None):
         super(NonLinear, self).__init__()
@@ -351,10 +317,10 @@ def _build_attn_mask(base_mask, seg_id, atom_mask, seg_valid, glob_valid, *, num
         atom_mask (Tensor): padding mask for atoms [B, N]
         seg_valid (Tensor): which segments are valid [B, S]
         glob_valid (Tensor): [B, 1] indicating if GLOB token is valid
-        num_heads (int): number of attention heads (for expansion)
-    
+        num_heads (int): retained for caller compatibility; heads broadcast
+
     Returns:
-        Tensor: [B, num_heads, T, T] additive mask (0 for allowed, -inf for block)
+        Tensor: [B, 1, T, T] additive mask, broadcast over attention heads
     """
     B, S = seg_valid.shape
     N = seg_id.shape[1]
@@ -364,7 +330,6 @@ def _build_attn_mask(base_mask, seg_id, atom_mask, seg_valid, glob_valid, *, num
     device = base_mask.device
 
     attn_mask = base_mask.clone()
-    padding_msk = attn_mask == float("-inf")
 
     seg_rows_all = torch.arange(S, device=device) + 2
     atom_rows = torch.arange(N, device=device) + special_len
@@ -401,37 +366,36 @@ def _build_attn_mask(base_mask, seg_id, atom_mask, seg_valid, glob_valid, *, num
         attn_mask[b, pad_atoms, :] = float("-inf")
         attn_mask[b, :, pad_atoms] = float("-inf")
 
-    # 6. Ensure diagonal is 0 (self-attention allowed unless already -inf)
+    # All tokens, including padding, retain diagonal self-attention.
     diag_idx = torch.arange(T, device=device)
     attn_mask[:, diag_idx, diag_idx] = 0.0
 
-    return attn_mask.unsqueeze(1).float()  # [B, num_heads, T, T]
-    
-    
-def build_padding_only_attn_mask(atom_mask, seg_valid, glob_valid, *,
-                                 num_heads: int, device=None):
+    return attn_mask.unsqueeze(1).float()  # [B, 1, T, T]
+
+
+def build_padding_only_attn_mask(atom_mask, seg_valid, glob_valid, *, num_heads: int, device=None):
     B, N = atom_mask.shape
     S = seg_valid.shape[1]
     device = atom_mask.device if device is None else device
 
-    cls_valid  = torch.ones(B, 1, dtype=torch.bool, device=device)          # CLS=1
-    glob_valid = glob_valid.view(B, 1).bool().to(device)                    # GLOB¡Ê{0,1}
-    seg_valid  = seg_valid.bool().to(device)                                # S seg tokens
-    atom_valid = atom_mask.bool().to(device)                                # N atom tokens
+    cls_valid = torch.ones(B, 1, dtype=torch.bool, device=device)  # CLS=1
+    glob_valid = glob_valid.view(B, 1).bool().to(device)  # GLOB validity
+    seg_valid = seg_valid.bool().to(device)  # S seg tokens
+    atom_valid = atom_mask.bool().to(device)  # N atom tokens
 
     token_valid = torch.cat([cls_valid, glob_valid, seg_valid, atom_valid], dim=1)
     T = token_valid.size(1)
 
-    valid_pair = token_valid.unsqueeze(-1) & token_valid.unsqueeze(-2)      # outer AND
+    valid_pair = token_valid.unsqueeze(-1) & token_valid.unsqueeze(-2)  # outer AND
 
     attn = torch.zeros(B, 1, T, T, device=device, dtype=torch.float32)
     attn = attn.masked_fill(~valid_pair.unsqueeze(1), float("-inf"))
-    
+
     eye = torch.eye(T, dtype=torch.bool, device=device).view(1, 1, T, T)
     attn = torch.where(eye, torch.zeros_like(attn), attn)
 
     attn = attn.expand(-1, num_heads, -1, -1).contiguous()
-    return attn    
+    return attn
 
 
 class DropPath(torch.nn.Module):
@@ -470,7 +434,6 @@ class OuterProduct(nn.Module):
 
     def _opm(self, a, b):
         bsz, n, d = a.shape
-        # outer = torch.einsum("...bc,...de->...bdce", a, b)
         a = a.view(bsz, n, 1, d, 1)
         b = b.view(bsz, 1, n, 1, d)
         outer = a * b
@@ -484,7 +447,6 @@ class OuterProduct(nn.Module):
         op_mask: Optional[torch.Tensor] = None,
         op_norm: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         ab = self.linear_in(m) * op_mask
         a, b = ab.chunk(2, dim=-1)
 
@@ -512,32 +474,31 @@ class TriangleMultiplication(nn.Module):
 
     def _triangle_forward(self, z, mask, scale):
         mask = mask.unsqueeze(-1).float() * scale.unsqueeze(-1)
-    
+
         g = self.linear_g(z)
         ab = self.linear_ab_p(z) * mask * torch.sigmoid(self.linear_ab_g(z))
         a, b = torch.chunk(ab, 2, dim=-1)
-    
+
         a1 = permute_final_dims(a, (2, 0, 1))
         b1 = b.transpose(-1, -3)
         x = torch.matmul(a1, b1)
-    
+
         b2 = permute_final_dims(b, (2, 0, 1))
         a2 = a.transpose(-1, -3)
         x = x + torch.matmul(a2, b2)
-    
+
         x = permute_final_dims(x, (1, 2, 0))
-    
+
         x = self.layer_norm_out(x)
         x = self.linear_z(x)
         return g * x
-        
+
     def forward(
         self,
         z: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-    
         if self.training and torch.is_grad_enabled():
             x = checkpoint(self._triangle_forward, z, mask, scale, use_reentrant=False)
         else:
@@ -547,7 +508,6 @@ class TriangleMultiplication(nn.Module):
 
 class Transition(nn.Module):
     def __init__(self, d_in, n, dropout=0.0):
-
         super(Transition, self).__init__()
 
         self.d_in = d_in
@@ -569,7 +529,6 @@ class Transition(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-
         x = self._transition(x=x)
         return x
 
@@ -612,15 +571,12 @@ class MovementPredictionHead(nn.Module):
     ) -> Tensor:
         bsz, n_node, _ = query.size()
         query = self.layer_norm(query)
-        q = (
-            self.q_proj(query).view(bsz, n_node, self.num_head, -1).transpose(1, 2)
-            * self.scaling
-        )
+        q = self.q_proj(query).view(bsz, n_node, self.num_head, -1).transpose(1, 2) * self.scaling
         k = self.k_proj(query).view(bsz, n_node, self.num_head, -1).transpose(1, 2)
         v = self.v_proj(query).view(bsz, n_node, self.num_head, -1).transpose(1, 2)
         attn = q @ k.transpose(-1, -2)  # [bsz, head, n, n]
         pair = self.pair_layer_norm(pair)
-        bias = self.linear_bias(pair).permute(0, 3, 1, 2).contiguous()       
+        bias = self.linear_bias(pair).permute(0, 3, 1, 2).contiguous()
         attn = attn + bias
         attn = attn + attn_mask
         attn = F.softmax(attn, dim=-1)
@@ -634,7 +590,7 @@ class MovementPredictionHead(nn.Module):
         x = x.permute(0, 3, 2, 1, 4).contiguous().view(bsz, n_node, 3, -1)
         cur_force = self.force_proj1(x).view(bsz, n_node, 3)
         return cur_force
-        
+
 
 class MaskLMHead(nn.Module):
     """Head for masked language modeling."""
